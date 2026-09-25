@@ -571,6 +571,23 @@ def _kill_pids_posix(pids: list[int], killed: list[int], failed: list[tuple[int,
                   for pid in survivors)
 
 
+def _find_stale_dashboard_pids(*, exclude_pids: set[int] | None = None,
+                               scope_home: str | None = None) -> list[int]:
+    """Local copy of the stale-dashboard scan used by the update cleanup.
+
+    The same logic lives in ``hermes_cli.main_dashboard`` too. Keeping it here means the
+    post-update cleanup never depends on a *stale* ``main_dashboard`` module that was
+    imported before the update swapped the code on disk (which is exactly the shape of
+    the ``scope_home`` TypeError the E2E run hit on Linux).
+    """
+    pids = [pid for pid, _cmd in _scan_dashboard_processes(exclude_pids=exclude_pids)]
+    # Same wrapper-shell spare as the main_dashboard helper: ``bash -c 'hermes
+    # dashboard --stop'`` must never be treated as a backend.
+    ancestors = _caller_ancestor_pids()
+    pids = [pid for pid in pids if not _is_caller_wrapper_shell(pid, ancestors)]
+    return _pids_owned_by_hermes_home(pids, scope_home) if scope_home else pids
+
+
 def _kill_stale_dashboard_processes(
     reason: str = "the running backend no longer matches the updated frontend", *,
     restart_managed: bool = False, already_restarted_units: "set[str] | None" = None,
@@ -607,7 +624,12 @@ def _kill_stale_dashboard_processes(
         # An SSH-owned backend belongs to an attached Desktop client; killing it strands that
         # client's fixed SSH port-forward. Same ownership records as the reaper.
         exclude |= _lock_owned_serve_pids()
-    pids = _dash._find_stale_dashboard_pids(exclude_pids=exclude or None, scope_home=scope_home)
+    try:
+        pids = _dash._find_stale_dashboard_pids(exclude_pids=exclude or None, scope_home=scope_home)
+    except TypeError:
+        # Stale pre-update ``main_dashboard`` without ``scope_home`` support (mixed-version
+        # import after an in-place update). Fall back to the local implementation above.
+        pids = _find_stale_dashboard_pids(exclude_pids=exclude or None, scope_home=scope_home)
     if not pids:
         return _empty_result()
     # Snapshot systemd unit/cgroup and argv BEFORE killing (the cgroup dies with the process).
